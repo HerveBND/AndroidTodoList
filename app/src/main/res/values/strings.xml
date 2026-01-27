@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TodoList</string>
+
+    <!-- Todo List Screen -->
+    <string name="todo_list_title">Ma Todo Liste</string>
+    <string name="empty_list_message">Aucune tâche</string>
+    <string name="delete_todo">Supprimer</string>
+    <string name="add_new_task">Nouvelle tâche</string>
+
+    <!-- Todo Detail Screen -->
+    <string name="detail_title">Détail de la tâche</string>
+    <string name="new_task_title">Nouvelle tâche</string>
+    <string name="title_label">Titre</string>
+    <string name="title_hint">Titre de la tâche</string>
+    <string name="description_label">Description</string>
+    <string name="description_hint">Description (optionnelle)</string>
+    <string name="status_label">Statut</string>
+    <string name="status_completed">Complétée</string>
+    <string name="status_not_completed">Non complétée</string>
+    <string name="created_at_label">Créée le</string>
+    <string name="delete_task_button">SUPPRIMER LA TÂCHE</string>
+    <string name="save_button">ENREGISTRER</string>
+
+    <!-- Common -->
+    <string name="back">Retour</string>
+</resources>
