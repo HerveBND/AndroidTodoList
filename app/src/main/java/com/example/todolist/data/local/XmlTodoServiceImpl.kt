@@ -3,16 +3,18 @@ package com.example.todolist.data.local
 import android.content.Context
 import android.util.Log
 import android.util.Xml
+import com.example.todolist.di.IoDispatcher
 import com.example.todolist.domain.model.Todo
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserException
-import org.xmlpull.v1.XmlSerializer
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.withContext
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -22,10 +24,14 @@ import javax.inject.Singleton
  *
  * Thread-safe grâce à l'utilisation d'un Mutex.
  * Gère un fichier d'index et des fichiers individuels par todo.
+ *
+ * @property context Context Android pour accéder au système de fichiers
+ * @property ioDispatcher Dispatcher dédié aux opérations IO, injectable pour les tests
  */
 @Singleton
 class XmlTodoServiceImpl @Inject constructor(
-    private val context: Context
+    private val context: Context,
+    @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : XmlTodoService {
 
     private val mutex = Mutex()
@@ -63,169 +69,181 @@ class XmlTodoServiceImpl @Inject constructor(
         val valid: Boolean
     )
 
-    override suspend fun loadAllTodos(): Result<List<Todo>> = mutex.withLock {
-        return try {
-            if (!indexFile.exists()) {
-                Log.d(TAG, "Index file does not exist, returning empty list")
-                return Result.success(emptyList())
+    override suspend fun loadAllTodos(): Result<List<Todo>> = withContext(ioDispatcher) {
+        mutex.withLock {
+            try {
+                if (!indexFile.exists()) {
+                    Log.d(TAG, "Index file does not exist, returning empty list")
+                    return@withContext Result.success(emptyList())
+                }
+
+                val todoRefs = parseIndex()
+                val todos = mutableListOf<Todo>()
+
+                for (ref in todoRefs) {
+                    if (!ref.valid) {
+                        Log.d(TAG, "Skipping invalid todo: ${ref.id}")
+                        continue
+                    }
+
+                    val todoFile = File(todosDir, ref.filename)
+                    if (!todoFile.exists()) {
+                        Log.w(TAG, "Todo file not found: ${ref.filename}, marking as invalid")
+                        markTodoAsInvalidInternal(ref.id)
+                        continue
+                    }
+
+                    try {
+                        val todo = parseTodoFile(todoFile)
+                        todos.add(todo)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error parsing todo file: ${ref.filename}", e)
+                        markTodoAsInvalidInternal(ref.id)
+                    }
+                }
+
+                Log.d(TAG, "Loaded ${todos.size} todos")
+                Result.success(todos)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading todos", e)
+                Result.failure(e)
             }
+        }
+    }
 
-            val todoRefs = parseIndex()
-            val todos = mutableListOf<Todo>()
+    override suspend fun createTodo(title: String, description: String, isCompleted: Boolean): Result<Todo> = withContext(ioDispatcher) {
+        mutex.withLock {
+            try {
+                val id = UUID.randomUUID().toString()
+                val timestamp = System.currentTimeMillis()
+                val filename = "$timestamp.xml"
+                val todo = Todo(
+                    id = id,
+                    title = title,
+                    description = description,
+                    isCompleted = isCompleted,
+                    createdAt = timestamp
+                )
 
-            for (ref in todoRefs) {
+                // Créer le fichier du todo
+                val todoFile = File(todosDir, filename)
+                writeTodoFile(todoFile, todo)
+
+                // Mettre à jour l'index
+                val todoRefs = if (indexFile.exists()) parseIndex().toMutableList() else mutableListOf()
+                todoRefs.add(TodoRef(id, filename, valid = true))
+                writeIndex(todoRefs)
+
+                Log.d(TAG, "Created todo: $id")
+                Result.success(todo)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error creating todo", e)
+                Result.failure(e)
+            }
+        }
+    }
+
+    override suspend fun updateTodo(todo: Todo): Result<Unit> = withContext(ioDispatcher) {
+        mutex.withLock {
+            try {
+                // Trouver le fichier correspondant dans l'index
+                if (!indexFile.exists()) {
+                    return@withContext Result.failure(IOException("Index file not found"))
+                }
+
+                val todoRefs = parseIndex()
+                val ref = todoRefs.find { it.id == todo.id }
+                    ?: return@withContext Result.failure(IOException("Todo not found in index: ${todo.id}"))
+
                 if (!ref.valid) {
-                    Log.d(TAG, "Skipping invalid todo: ${ref.id}")
-                    continue
+                    return@withContext Result.failure(IOException("Todo is marked as invalid: ${todo.id}"))
                 }
 
                 val todoFile = File(todosDir, ref.filename)
                 if (!todoFile.exists()) {
-                    Log.w(TAG, "Todo file not found: ${ref.filename}, marking as invalid")
-                    markTodoAsInvalidInternal(ref.id)
-                    continue
+                    Log.w(TAG, "Todo file not found during update: ${ref.filename}")
+                    markTodoAsInvalidInternal(todo.id)
+                    return@withContext Result.failure(IOException("Todo file not found"))
                 }
 
-                try {
-                    val todo = parseTodoFile(todoFile)
-                    todos.add(todo)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error parsing todo file: ${ref.filename}", e)
-                    markTodoAsInvalidInternal(ref.id)
+                writeTodoFile(todoFile, todo)
+                Log.d(TAG, "Updated todo: ${todo.id}")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating todo", e)
+                Result.failure(e)
+            }
+        }
+    }
+
+    override suspend fun deleteTodo(id: String): Result<Unit> = withContext(ioDispatcher) {
+        mutex.withLock {
+            try {
+                if (!indexFile.exists()) {
+                    return@withContext Result.failure(IOException("Index file not found"))
                 }
-            }
 
-            Log.d(TAG, "Loaded ${todos.size} todos")
-            Result.success(todos)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading todos", e)
-            Result.failure(e)
+                val todoRefs = parseIndex().toMutableList()
+                val ref = todoRefs.find { it.id == id }
+                    ?: return@withContext Result.failure(IOException("Todo not found in index: $id"))
+
+                // Supprimer le fichier
+                val todoFile = File(todosDir, ref.filename)
+                if (todoFile.exists()) {
+                    todoFile.delete()
+                }
+
+                // Retirer de l'index
+                todoRefs.removeIf { it.id == id }
+                writeIndex(todoRefs)
+
+                Log.d(TAG, "Deleted todo: $id")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error deleting todo", e)
+                Result.failure(e)
+            }
         }
     }
 
-    override suspend fun createTodo(title: String, description: String, isCompleted: Boolean): Result<Todo> = mutex.withLock {
-        return try {
-            val id = UUID.randomUUID().toString()
-            val timestamp = System.currentTimeMillis()
-            val filename = "$timestamp.xml"
-            val todo = Todo(
-                id = id,
-                title = title,
-                description = description,
-                isCompleted = isCompleted,
-                createdAt = timestamp
-            )
+    override suspend fun getTodoById(id: String): Result<Todo?> = withContext(ioDispatcher) {
+        mutex.withLock {
+            try {
+                if (!indexFile.exists()) {
+                    return@withContext Result.success(null)
+                }
 
-            // Créer le fichier du todo
-            val todoFile = File(todosDir, filename)
-            writeTodoFile(todoFile, todo)
+                val todoRefs = parseIndex()
+                val ref = todoRefs.find { it.id == id } ?: return@withContext Result.success(null)
 
-            // Mettre à jour l'index
-            val todoRefs = if (indexFile.exists()) parseIndex().toMutableList() else mutableListOf()
-            todoRefs.add(TodoRef(id, filename, valid = true))
-            writeIndex(todoRefs)
+                if (!ref.valid) {
+                    return@withContext Result.success(null)
+                }
 
-            Log.d(TAG, "Created todo: $id")
-            Result.success(todo)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creating todo", e)
-            Result.failure(e)
+                val todoFile = File(todosDir, ref.filename)
+                if (!todoFile.exists()) {
+                    markTodoAsInvalidInternal(id)
+                    return@withContext Result.success(null)
+                }
+
+                val todo = parseTodoFile(todoFile)
+                Result.success(todo)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error getting todo by id", e)
+                Result.failure(e)
+            }
         }
     }
 
-    override suspend fun updateTodo(todo: Todo): Result<Unit> = mutex.withLock {
-        return try {
-            // Trouver le fichier correspondant dans l'index
-            if (!indexFile.exists()) {
-                return Result.failure(IOException("Index file not found"))
-            }
-
-            val todoRefs = parseIndex()
-            val ref = todoRefs.find { it.id == todo.id }
-                ?: return Result.failure(IOException("Todo not found in index: ${todo.id}"))
-
-            if (!ref.valid) {
-                return Result.failure(IOException("Todo is marked as invalid: ${todo.id}"))
-            }
-
-            val todoFile = File(todosDir, ref.filename)
-            if (!todoFile.exists()) {
-                Log.w(TAG, "Todo file not found during update: ${ref.filename}")
-                markTodoAsInvalidInternal(todo.id)
-                return Result.failure(IOException("Todo file not found"))
-            }
-
-            writeTodoFile(todoFile, todo)
-            Log.d(TAG, "Updated todo: ${todo.id}")
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating todo", e)
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun deleteTodo(id: String): Result<Unit> = mutex.withLock {
-        return try {
-            if (!indexFile.exists()) {
-                return Result.failure(IOException("Index file not found"))
-            }
-
-            val todoRefs = parseIndex().toMutableList()
-            val ref = todoRefs.find { it.id == id }
-                ?: return Result.failure(IOException("Todo not found in index: $id"))
-
-            // Supprimer le fichier
-            val todoFile = File(todosDir, ref.filename)
-            if (todoFile.exists()) {
-                todoFile.delete()
-            }
-
-            // Retirer de l'index
-            todoRefs.removeIf { it.id == id }
-            writeIndex(todoRefs)
-
-            Log.d(TAG, "Deleted todo: $id")
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error deleting todo", e)
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun getTodoById(id: String): Result<Todo?> = mutex.withLock {
-        return try {
-            if (!indexFile.exists()) {
-                return Result.success(null)
-            }
-
-            val todoRefs = parseIndex()
-            val ref = todoRefs.find { it.id == id } ?: return Result.success(null)
-
-            if (!ref.valid) {
-                return Result.success(null)
-            }
-
-            val todoFile = File(todosDir, ref.filename)
-            if (!todoFile.exists()) {
+    override suspend fun markTodoAsInvalid(id: String): Result<Unit> = withContext(ioDispatcher) {
+        mutex.withLock {
+            try {
                 markTodoAsInvalidInternal(id)
-                return Result.success(null)
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error marking todo as invalid", e)
+                Result.failure(e)
             }
-
-            val todo = parseTodoFile(todoFile)
-            Result.success(todo)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting todo by id", e)
-            Result.failure(e)
-        }
-    }
-
-    override suspend fun markTodoAsInvalid(id: String): Result<Unit> = mutex.withLock {
-        return try {
-            markTodoAsInvalidInternal(id)
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error marking todo as invalid", e)
-            Result.failure(e)
         }
     }
 
